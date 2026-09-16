@@ -709,4 +709,55 @@ function aav_dt_render_page() {
         </form>
     </div>
     <?php
+    /* ================================================================== *
+     * MISES À JOUR DEPUIS GITHUB (dépôt public, sans extension tierce)
+     * Incrémente la version dans l'en-tête, pousse un tag vX.Y.Z sur
+     * GitHub avec le zip du plugin en pièce jointe de la release, et
+     * WordPress proposera la mise à jour dans Extensions.
+     * ================================================================== */
+    define( 'AAV_TST_REPO', 'biolay-group/aav-testimonials' ); // ← à adapter
+    define( 'AAV_TST_SLUG', plugin_basename( __FILE__ ) );      // ne pas toucher
+    
+    add_filter( 'update_plugins_github.com', function ( $update, $plugin_data, $plugin_file ) {
+    	if ( AAV_TST_SLUG !== $plugin_file ) {
+    		return $update;
+    	}
+    	$cache_key = 'aav_upd_' . md5( AAV_TST_REPO );
+    	$release   = get_transient( $cache_key );
+    
+    	if ( false === $release ) {
+    		$res = wp_remote_get(
+    			'https://api.github.com/repos/' . AAV_TST_REPO . '/releases/latest',
+    			array( 'timeout' => 10, 'headers' => array( 'Accept' => 'application/vnd.github+json' ) )
+    		);
+    		if ( is_wp_error( $res ) || 200 !== wp_remote_retrieve_response_code( $res ) ) {
+    			return $update;
+    		}
+    		$release = json_decode( wp_remote_retrieve_body( $res ), true );
+    		set_transient( $cache_key, $release, 6 * HOUR_IN_SECONDS );
+    	}
+    	if ( empty( $release['tag_name'] ) ) {
+    		return $update;
+    	}
+    
+    	$remote_version = ltrim( $release['tag_name'], 'v' );
+    	if ( version_compare( $remote_version, $plugin_data['Version'], '<=' ) ) {
+    		return $update;
+    	}
+    
+    	// zip attaché à la release, sinon archive automatique du tag
+    	$package = '';
+    	if ( ! empty( $release['assets'][0]['browser_download_url'] ) ) {
+    		$package = $release['assets'][0]['browser_download_url'];
+    	} elseif ( ! empty( $release['zipball_url'] ) ) {
+    		$package = $release['zipball_url'];
+    	}
+    
+    	return array(
+    		'slug'    => dirname( AAV_TST_SLUG ),
+    		'version' => $remote_version,
+    		'url'     => 'https://github.com/' . AAV_TST_REPO,
+    		'package' => $package,
+    	);
+    }, 10, 3 );
 }
