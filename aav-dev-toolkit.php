@@ -1,40 +1,67 @@
 <?php
 /**
  * Plugin Name: AAV Dev Toolkit
- * Description: Boite a outils d'administration pour le site AAV, sans acces FTP :
- *              diagnostic du site, export theme/extensions, limites PHP, mu-plugins,
- *              remplacement, lecture et suppression de fichiers dans wp-content,
- *              purge des caches, normalisation des blocs AAV. Reserve aux administrateurs.
- * Version:     1.7.0
+ * Description: Boîte à outils d'administration pour le site AAV, sans accès FTP :
+ *              diagnostic, export thème/extensions, limites PHP, mu-plugins,
+ *              remplacement et suppression de fichiers, purge des caches,
+ *              normalisation des blocs AAV. Réservé aux administrateurs.
+ * Version:     1.8.0
  * Author:      Biolay Group
  * Update URI:  https://github.com/biolay-group/aav-dev-toolkit
  * License:     GPL-2.0-or-later
  *
- * AVERTISSEMENT SECURITE
- * Cet outil depose du code executable et modifie des fichiers. Toutes les actions
+ * AVERTISSEMENT SÉCURITÉ
+ * Cet outil dépose du code exécutable et modifie des fichiers. Toutes les actions
  * exigent le droit "manage_options" et un jeton (nonce). Sur un site en production,
- * installe-le le temps de ton intervention, puis desactive-le ou retire-le.
+ * installez-le le temps de l'intervention, puis désactivez-le ou retirez-le.
+ *
+ * Verrou optionnel : définir AAV_DT_LOCK à true dans wp-config.php désactive
+ * toutes les opérations d'écriture (lecture et diagnostic restent disponibles).
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'AAV_DT_VERSION', '1.7.0' );
+define( 'AAV_DT_VERSION', '1.8.0' );
 define( 'AAV_DT_CAP', 'manage_options' );
 define( 'AAV_DT_SLUG', 'aav-devtools' );
 define( 'AAV_DT_FILE', plugin_basename( __FILE__ ) );
 define( 'AAV_DT_REPO', 'biolay-group/aav-dev-toolkit' );
+define( 'AAV_DT_BACKUP_DIR', WP_CONTENT_DIR . '/aav-backups' );
 
-/* Onglets de la page (cle => libelle). */
+/* =========================================================================
+ *  LANGUE : français / anglais selon la langue de l'administration
+ * ====================================================================== */
+
+/** L'utilisateur connecté lit-il l'admin en français ? */
+function aav_dt_is_fr() {
+	static $fr = null;
+	if ( null === $fr ) {
+		$locale = function_exists( 'get_user_locale' ) ? get_user_locale() : get_locale();
+		$fr     = ( 0 === strpos( $locale, 'fr' ) );
+	}
+	return $fr;
+}
+
+/** Retourne la chaîne française ou anglaise selon la langue de l'admin. */
+function aav_dt__( $fr, $en ) {
+	return aav_dt_is_fr() ? $fr : $en;
+}
+
+/** Idem, échappé pour affichage HTML. */
+function aav_dt_e( $fr, $en ) {
+	echo esc_html( aav_dt__( $fr, $en ) );
+}
+
 function aav_dt_tabs() {
 	return array(
-		'diag'   => 'Diagnostic',
-		'export' => 'Export',
-		'files'  => 'Fichiers',
-		'mu'     => 'Mu-plugins',
-		'php'    => 'Limites PHP',
-		'tools'  => 'Maintenance',
+		'diag'   => aav_dt__( 'Diagnostic', 'Diagnostics' ),
+		'export' => aav_dt__( 'Export', 'Export' ),
+		'files'  => aav_dt__( 'Fichiers', 'Files' ),
+		'mu'     => aav_dt__( 'Mu-plugins', 'Mu-plugins' ),
+		'php'    => aav_dt__( 'Limites PHP', 'PHP limits' ),
+		'tools'  => aav_dt__( 'Maintenance', 'Maintenance' ),
 	);
 }
 
@@ -43,17 +70,52 @@ add_action( 'admin_menu', function () {
 } );
 
 /* =========================================================================
- *  HELPERS
+ *  SÉCURITÉ ET HELPERS
  * ====================================================================== */
 
-function aav_dt_guard( $nonce_action ) {
-	if ( ! current_user_can( AAV_DT_CAP ) ) {
-		wp_die( 'Acces refuse.', '', array( 'response' => 403 ) );
-	}
-	check_admin_referer( $nonce_action );
+/** Le verrou d'écriture est-il actif ? (constante dans wp-config.php) */
+function aav_dt_locked() {
+	return defined( 'AAV_DT_LOCK' ) && AAV_DT_LOCK;
 }
 
-/** Retour a la page, en conservant l'onglet actif. */
+/**
+ * Garde commune : droits, jeton, et verrou pour les opérations d'écriture.
+ * $writes = true pour toute action qui modifie le site.
+ */
+function aav_dt_guard( $nonce_action, $writes = true ) {
+	if ( ! current_user_can( AAV_DT_CAP ) ) {
+		wp_die( esc_html( aav_dt__( 'Accès refusé.', 'Access denied.' ) ), '', array( 'response' => 403 ) );
+	}
+	check_admin_referer( $nonce_action );
+	if ( $writes && aav_dt_locked() ) {
+		wp_die(
+			esc_html( aav_dt__(
+				'Les opérations d\'écriture sont désactivées (AAV_DT_LOCK est défini dans wp-config.php).',
+				'Write operations are disabled (AAV_DT_LOCK is set in wp-config.php).'
+			) ),
+			'',
+			array( 'response' => 403 )
+		);
+	}
+}
+
+/** Journal des opérations sensibles : qui, quoi, quand (30 dernières). */
+function aav_dt_log( $what, $detail = '' ) {
+	$log   = get_option( 'aav_dt_log', array() );
+	if ( ! is_array( $log ) ) {
+		$log = array();
+	}
+	$user  = wp_get_current_user();
+	array_unshift( $log, array(
+		'time'   => time(),
+		'user'   => $user ? $user->user_login : '?',
+		'what'   => $what,
+		'detail' => $detail,
+		'ip'     => isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '',
+	) );
+	update_option( 'aav_dt_log', array_slice( $log, 0, 30 ), false );
+}
+
 function aav_dt_redirect( $status, $tab = '' ) {
 	$args = array( 'page' => AAV_DT_SLUG, 'aav_status' => rawurlencode( $status ) );
 	if ( $tab ) {
@@ -71,21 +133,45 @@ function aav_dt_url( $tab = '', $args = array() ) {
 	return add_query_arg( array_merge( $base, $args ), admin_url( 'tools.php' ) );
 }
 
+/** Nettoie un chemin relatif fourni par l'utilisateur (refuse les remontées). */
 function aav_dt_clean_rel( $raw ) {
 	$rel = ltrim( str_replace( '\\', '/', trim( (string) $raw ) ), '/' );
-	if ( '' === $rel || false !== strpos( $rel, '..' ) ) {
+	if ( '' === $rel || false !== strpos( $rel, '..' ) || false !== strpos( $rel, "\0" ) ) {
 		return '';
 	}
 	return $rel;
 }
 
-function aav_dt_resolve_in_content( $rel ) {
-	$base   = realpath( WP_CONTENT_DIR );
-	$target = realpath( WP_CONTENT_DIR . '/' . $rel );
-	if ( ! $base || ! $target || 0 !== strpos( $target, $base ) ) {
+/** Résout un chemin dans un dossier de base et vérifie qu'il n'en sort pas. */
+function aav_dt_resolve_in( $base_dir, $rel ) {
+	$base   = realpath( $base_dir );
+	$target = realpath( rtrim( $base_dir, '/' ) . '/' . $rel );
+	if ( ! $base || ! $target ) {
+		return '';
+	}
+	// Le séparateur final évite qu'un dossier voisin au nom proche passe le test.
+	if ( 0 !== strpos( $target . DIRECTORY_SEPARATOR, rtrim( $base, '/\\' ) . DIRECTORY_SEPARATOR ) ) {
 		return '';
 	}
 	return $target;
+}
+
+function aav_dt_resolve_in_content( $rel ) {
+	return aav_dt_resolve_in( WP_CONTENT_DIR, $rel );
+}
+
+function aav_dt_mu_dir() {
+	return defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR . '/mu-plugins';
+}
+
+/** Dossier de sauvegardes du toolkit, protégé des regards. */
+function aav_dt_backup_dir() {
+	if ( ! is_dir( AAV_DT_BACKUP_DIR ) ) {
+		wp_mkdir_p( AAV_DT_BACKUP_DIR );
+		@file_put_contents( AAV_DT_BACKUP_DIR . '/index.php', "<?php\n// Silence." );
+		@file_put_contents( AAV_DT_BACKUP_DIR . '/.htaccess', "Deny from all\n" );
+	}
+	return AAV_DT_BACKUP_DIR;
 }
 
 function aav_dt_put_block( $file, $block, $begin, $end ) {
@@ -144,8 +230,13 @@ function aav_dt_stream_zip_dir( $dir, $name ) {
 	aav_dt_stream_file( $tmp, $name . '-' . gmdate( 'Ymd-His' ) . '.zip' );
 }
 
-/** Sauvegardes .bak laissees dans les extensions et les themes. */
-function aav_dt_find_baks() {
+/** Sauvegardes .bak dans les extensions et thèmes (résultat mis en cache 5 min). */
+function aav_dt_find_baks( $force = false ) {
+	$cached = get_transient( 'aav_dt_baks' );
+	if ( ! $force && is_array( $cached ) ) {
+		return $cached;
+	}
+
 	$found = array();
 	foreach ( array( WP_PLUGIN_DIR, get_theme_root() ) as $root ) {
 		if ( ! is_dir( $root ) ) {
@@ -166,20 +257,20 @@ function aav_dt_find_baks() {
 			continue;
 		}
 	}
+	set_transient( 'aav_dt_baks', $found, 5 * MINUTE_IN_SECONDS );
 	return $found;
 }
 
-/** Extensions de cache connues, actives sur le site. */
 function aav_dt_cache_plugins() {
 	$known = array(
-		'litespeed-cache/litespeed-cache.php'   => 'LiteSpeed Cache',
-		'wp-rocket/wp-rocket.php'               => 'WP Rocket',
-		'w3-total-cache/w3-total-cache.php'     => 'W3 Total Cache',
-		'wp-super-cache/wp-cache.php'           => 'WP Super Cache',
-		'wp-fastest-cache/wpFastestCache.php'   => 'WP Fastest Cache',
-		'autoptimize/autoptimize.php'           => 'Autoptimize',
-		'sg-cachepress/sg-cachepress.php'       => 'SiteGround Optimizer',
-		'breeze/breeze.php'                     => 'Breeze',
+		'litespeed-cache/litespeed-cache.php' => 'LiteSpeed Cache',
+		'wp-rocket/wp-rocket.php'             => 'WP Rocket',
+		'w3-total-cache/w3-total-cache.php'   => 'W3 Total Cache',
+		'wp-super-cache/wp-cache.php'         => 'WP Super Cache',
+		'wp-fastest-cache/wpFastestCache.php' => 'WP Fastest Cache',
+		'autoptimize/autoptimize.php'         => 'Autoptimize',
+		'sg-cachepress/sg-cachepress.php'     => 'SiteGround Optimizer',
+		'breeze/breeze.php'                   => 'Breeze',
 	);
 	$active = (array) get_option( 'active_plugins', array() );
 	$found  = array();
@@ -191,34 +282,36 @@ function aav_dt_cache_plugins() {
 	return $found;
 }
 
-/** Etat de sante du site, en une passe. */
 function aav_dt_diagnostics() {
 	global $wp_version, $wpdb;
 
 	$theme   = wp_get_theme();
-	$mu_dir  = defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR . '/mu-plugins';
+	$mu_dir  = aav_dt_mu_dir();
 	$mu      = is_dir( $mu_dir ) ? array_values( array_diff( scandir( $mu_dir ), array( '.', '..' ) ) ) : array();
 	$actives = (array) get_option( 'active_plugins', array() );
 	$locale  = get_option( 'WPLANG' );
+	$caches  = aav_dt_cache_plugins();
 
 	return array(
-		'WordPress'          => $wp_version,
-		'PHP'                => PHP_VERSION . ' (' . php_sapi_name() . ')',
-		'MySQL'              => $wpdb->db_version(),
-		'Theme actif'        => $theme->get( 'Name' ) . ' ' . $theme->get( 'Version' ),
-		'Extensions actives' => count( $actives ),
-		'Mu-plugins'         => $mu ? implode( ', ', $mu ) : 'aucun',
-		'Langue du site'     => $locale ? $locale : 'en_US (defaut)',
-		'Fuseau horaire'     => get_option( 'timezone_string' ) ?: get_option( 'gmt_offset' ) . 'h',
-		'Limite memoire'     => ini_get( 'memory_limit' ) . ' (WP_MEMORY_LIMIT : ' . ( defined( 'WP_MEMORY_LIMIT' ) ? WP_MEMORY_LIMIT : 'n/d' ) . ')',
-		'Upload max'         => ini_get( 'upload_max_filesize' ),
-		'Temps d execution'  => ini_get( 'max_execution_time' ) . ' s',
-		'OPcache'            => ( function_exists( 'opcache_get_status' ) && @opcache_get_status( false ) ) ? 'actif' : 'inactif',
-		'WP_DEBUG'           => ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ? 'ACTIF' : 'inactif',
-		'Cache objet'        => file_exists( WP_CONTENT_DIR . '/object-cache.php' ) ? 'present' : 'absent',
-		'Cache de page'      => file_exists( WP_CONTENT_DIR . '/advanced-cache.php' ) ? 'present (advanced-cache.php)' : 'absent',
-		'Extensions de cache'=> ( $c = aav_dt_cache_plugins() ) ? implode( ', ', $c ) : 'aucune detectee',
-		'HTTPS'              => is_ssl() ? 'oui' : 'non',
+		aav_dt__( 'WordPress', 'WordPress' )                       => $wp_version,
+		aav_dt__( 'PHP', 'PHP' )                                   => PHP_VERSION . ' (' . php_sapi_name() . ')',
+		aav_dt__( 'MySQL', 'MySQL' )                               => $wpdb->db_version(),
+		aav_dt__( 'Thème actif', 'Active theme' )                  => $theme->get( 'Name' ) . ' ' . $theme->get( 'Version' ),
+		aav_dt__( 'Extensions actives', 'Active plugins' )         => count( $actives ),
+		aav_dt__( 'Mu-plugins', 'Mu-plugins' )                     => $mu ? implode( ', ', $mu ) : aav_dt__( 'aucun', 'none' ),
+		aav_dt__( 'Langue du site', 'Site language' )              => $locale ? $locale : 'en_US ' . aav_dt__( '(défaut)', '(default)' ),
+		aav_dt__( 'Langue de cette admin', 'This admin language' ) => function_exists( 'get_user_locale' ) ? get_user_locale() : get_locale(),
+		aav_dt__( 'Fuseau horaire', 'Timezone' )                   => get_option( 'timezone_string' ) ?: get_option( 'gmt_offset' ) . 'h',
+		aav_dt__( 'Limite mémoire', 'Memory limit' )               => ini_get( 'memory_limit' ) . ' (WP_MEMORY_LIMIT : ' . ( defined( 'WP_MEMORY_LIMIT' ) ? WP_MEMORY_LIMIT : 'n/d' ) . ')',
+		aav_dt__( 'Upload maximum', 'Max upload' )                 => ini_get( 'upload_max_filesize' ),
+		aav_dt__( 'Temps d\'exécution', 'Execution time' )         => ini_get( 'max_execution_time' ) . ' s',
+		aav_dt__( 'OPcache', 'OPcache' )                           => ( function_exists( 'opcache_get_status' ) && @opcache_get_status( false ) ) ? aav_dt__( 'actif', 'enabled' ) : aav_dt__( 'inactif', 'disabled' ),
+		aav_dt__( 'WP_DEBUG', 'WP_DEBUG' )                         => ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ? aav_dt__( 'ACTIF', 'ENABLED' ) : aav_dt__( 'inactif', 'disabled' ),
+		aav_dt__( 'Cache objet', 'Object cache' )                  => file_exists( WP_CONTENT_DIR . '/object-cache.php' ) ? aav_dt__( 'présent', 'present' ) : aav_dt__( 'absent', 'absent' ),
+		aav_dt__( 'Cache de page', 'Page cache' )                  => file_exists( WP_CONTENT_DIR . '/advanced-cache.php' ) ? 'advanced-cache.php' : aav_dt__( 'absent', 'absent' ),
+		aav_dt__( 'Extensions de cache', 'Caching plugins' )       => $caches ? implode( ', ', $caches ) : aav_dt__( 'aucune détectée', 'none detected' ),
+		aav_dt__( 'HTTPS', 'HTTPS' )                               => is_ssl() ? aav_dt__( 'oui', 'yes' ) : aav_dt__( 'non', 'no' ),
+		aav_dt__( 'Verrou d\'écriture', 'Write lock' )             => aav_dt_locked() ? aav_dt__( 'ACTIF (AAV_DT_LOCK)', 'ENABLED (AAV_DT_LOCK)' ) : aav_dt__( 'inactif', 'disabled' ),
 	);
 }
 
@@ -355,16 +448,17 @@ PHP;
  *  ACTIONS
  * ====================================================================== */
 
-/* Export : theme */
+/* Export : thème (lecture seule) */
 add_action( 'admin_post_aav_dt_download_theme', function () {
-	aav_dt_guard( 'aav_dt_download_theme' );
+	aav_dt_guard( 'aav_dt_download_theme', false );
 	$dir = get_template_directory();
+	aav_dt_log( 'export_theme', basename( $dir ) );
 	aav_dt_stream_zip_dir( $dir, basename( $dir ) );
 } );
 
-/* Export : extension */
+/* Export : extension (lecture seule) */
 add_action( 'admin_post_aav_dt_download_plugin', function () {
-	aav_dt_guard( 'aav_dt_download_plugin' );
+	aav_dt_guard( 'aav_dt_download_plugin', false );
 
 	if ( ! function_exists( 'get_plugins' ) ) {
 		require_once ABSPATH . 'wp-admin/includes/plugin.php';
@@ -374,6 +468,7 @@ add_action( 'admin_post_aav_dt_download_plugin', function () {
 	if ( ! isset( $all[ $pf ] ) ) {
 		aav_dt_redirect( 'plg_notfound', 'export' );
 	}
+	aav_dt_log( 'export_plugin', $pf );
 
 	$dirname = dirname( $pf );
 	if ( '.' === $dirname ) {
@@ -427,15 +522,16 @@ add_action( 'admin_post_aav_dt_save_ini', function () {
 		$ok2 = aav_dt_put_block( ABSPATH . '.htaccess', $block2, '# BEGIN AAV', '# END AAV' );
 	}
 
+	aav_dt_log( 'php_limits', implode( ', ', array_map( function ( $k, $v ) { return "$k=$v"; }, array_keys( $lines ), $lines ) ) );
 	aav_dt_redirect( ( $ok1 && $ok2 ) ? 'ini_ok' : 'ini_err', 'php' );
 } );
 
-/* Mu-plugin : installation (avec sauvegarde de la version precedente) */
+/* Mu-plugin : installation */
 add_action( 'admin_post_aav_dt_install_mu', function () {
 	aav_dt_guard( 'aav_dt_install_mu' );
 
 	$filename = sanitize_file_name( wp_unslash( $_POST['mu_filename'] ?? '' ) );
-	if ( ! $filename || ! preg_match( '/\.php$/', $filename ) ) {
+	if ( ! $filename || ! preg_match( '/^[A-Za-z0-9._-]+\.php$/', $filename ) ) {
 		$filename = 'aav-scroll-refresh.php';
 	}
 
@@ -444,13 +540,12 @@ add_action( 'admin_post_aav_dt_install_mu', function () {
 		aav_dt_redirect( 'mu_invalid', 'mu' );
 	}
 
-	$dir = defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR . '/mu-plugins';
+	$dir = aav_dt_mu_dir();
 	if ( ! file_exists( $dir ) ) {
 		wp_mkdir_p( $dir );
 	}
 	$path = trailingslashit( $dir ) . $filename;
 
-	/* Garde-fou : refuse d'ecraser une version plus recente que celle envoyee. */
 	$ver_of = function ( $src ) {
 		return preg_match( '/^\s*\*\s*Version:\s*([0-9.]+)/mi', (string) $src, $m ) ? $m[1] : '';
 	};
@@ -462,9 +557,9 @@ add_action( 'admin_post_aav_dt_install_mu', function () {
 		}
 	}
 
-	/* Copie de securite de la version en place (hors mu-plugins : WP les charge tous). */
+	/* Sauvegarde hors du dossier mu-plugins (WordPress les charge tous). */
 	if ( is_file( $path ) ) {
-		@copy( $path, WP_CONTENT_DIR . '/' . $filename . '.bak-' . gmdate( 'Ymd-His' ) );
+		@copy( $path, trailingslashit( aav_dt_backup_dir() ) . $filename . '.bak-' . gmdate( 'Ymd-His' ) );
 	}
 
 	$ok = ( false !== @file_put_contents( $path, $content ) );
@@ -474,7 +569,65 @@ add_action( 'admin_post_aav_dt_install_mu', function () {
 	if ( $ok && md5( (string) @file_get_contents( $path ) ) !== md5( $content ) ) {
 		aav_dt_redirect( 'mu_mismatch', 'mu' );
 	}
+	aav_dt_log( 'mu_install', $filename . ' (' . $ver_of( $content ) . ')' );
 	aav_dt_redirect( $ok ? 'mu_ok' : 'mu_err', 'mu' );
+} );
+
+/* Mu-plugin : suppression (avec sauvegarde) */
+add_action( 'admin_post_aav_dt_delete_mu', function () {
+	aav_dt_guard( 'aav_dt_delete_mu' );
+
+	$name = sanitize_file_name( wp_unslash( $_POST['mu_file'] ?? '' ) );
+	if ( ! $name || ! preg_match( '/^[A-Za-z0-9._-]+\.php$/', $name ) ) {
+		aav_dt_redirect( 'mu_del_bad', 'mu' );
+	}
+
+	$target = aav_dt_resolve_in( aav_dt_mu_dir(), $name );
+	if ( '' === $target || ! is_file( $target ) ) {
+		aav_dt_redirect( 'mu_del_notfound', 'mu' );
+	}
+
+	/* Copie de sécurité : une suppression de mu-plugin n'est pas annulable autrement. */
+	$backup = trailingslashit( aav_dt_backup_dir() ) . $name . '.deleted-' . gmdate( 'Ymd-His' );
+	if ( ! @copy( $target, $backup ) ) {
+		aav_dt_redirect( 'mu_del_bakerr', 'mu' );
+	}
+
+	$ok = @unlink( $target );
+	if ( ! $ok ) {
+		@chmod( $target, 0644 );
+		$ok = @unlink( $target );
+	}
+	if ( $ok && function_exists( 'opcache_invalidate' ) ) {
+		@opcache_invalidate( $target, true );
+	}
+	aav_dt_log( 'mu_delete', $name );
+	aav_dt_redirect( $ok ? 'mu_del_ok' : 'mu_del_err', 'mu' );
+} );
+
+/* Mu-plugin : restauration depuis une sauvegarde */
+add_action( 'admin_post_aav_dt_restore_mu', function () {
+	aav_dt_guard( 'aav_dt_restore_mu' );
+
+	$name   = sanitize_file_name( wp_unslash( $_POST['backup_file'] ?? '' ) );
+	$source = $name ? aav_dt_resolve_in( aav_dt_backup_dir(), $name ) : '';
+	if ( '' === $source || ! is_file( $source ) ) {
+		aav_dt_redirect( 'mu_res_notfound', 'mu' );
+	}
+
+	/* Nom d'origine : on retire le suffixe .bak-... ou .deleted-... */
+	$orig = preg_replace( '/\.(bak|deleted)-[0-9\-]+$/', '', $name );
+	if ( ! preg_match( '/^[A-Za-z0-9._-]+\.php$/', $orig ) ) {
+		aav_dt_redirect( 'mu_res_bad', 'mu' );
+	}
+
+	$dest = trailingslashit( aav_dt_mu_dir() ) . $orig;
+	$ok   = @copy( $source, $dest );
+	if ( $ok && function_exists( 'opcache_invalidate' ) ) {
+		@opcache_invalidate( $dest, true );
+	}
+	aav_dt_log( 'mu_restore', $orig );
+	aav_dt_redirect( $ok ? 'mu_res_ok' : 'mu_res_err', 'mu' );
 } );
 
 /* Fichiers : remplacement */
@@ -492,13 +645,24 @@ add_action( 'admin_post_aav_dt_replace_file', function () {
 	if ( '' === $target || ! is_file( $target ) ) {
 		aav_dt_redirect( 'file_notfound', 'files' );
 	}
+
+	/* L'extension du fichier envoyé doit correspondre à celle de la cible :
+	   évite de déposer un .php à la place d'un .css par mégarde. */
+	$ext_target = strtolower( pathinfo( $target, PATHINFO_EXTENSION ) );
+	$ext_upload = strtolower( pathinfo( sanitize_file_name( $_FILES['replacement']['name'] ), PATHINFO_EXTENSION ) );
+	if ( $ext_target !== $ext_upload && empty( $_POST['ext_force'] ) ) {
+		aav_dt_redirect( 'file_ext', 'files' );
+	}
+
 	if ( ! @copy( $target, $target . '.bak-' . gmdate( 'Ymd-His' ) ) ) {
 		aav_dt_redirect( 'file_bak_err', 'files' );
 	}
 	$ok = @move_uploaded_file( $_FILES['replacement']['tmp_name'], $target );
-	if ( $ok && function_exists( 'opcache_invalidate' ) && preg_match( '/\.php$/i', $target ) ) {
+	if ( $ok && function_exists( 'opcache_invalidate' ) && 'php' === $ext_target ) {
 		@opcache_invalidate( $target, true );
 	}
+	delete_transient( 'aav_dt_baks' );
+	aav_dt_log( 'replace_file', $rel );
 	aav_dt_redirect( $ok ? 'file_ok' : 'file_err', 'files' );
 } );
 
@@ -522,6 +686,8 @@ add_action( 'admin_post_aav_dt_delete_file', function () {
 		@chmod( $target, 0644 );
 		$ok = @unlink( $target );
 	}
+	delete_transient( 'aav_dt_baks' );
+	aav_dt_log( 'delete_file', $rel );
 	aav_dt_redirect( $ok ? 'del_ok' : 'del_err', 'files' );
 } );
 
@@ -529,28 +695,28 @@ add_action( 'admin_post_aav_dt_delete_file', function () {
 add_action( 'admin_post_aav_dt_purge_baks', function () {
 	aav_dt_guard( 'aav_dt_purge_baks' );
 	$done = 0;
-	foreach ( aav_dt_find_baks() as $b ) {
+	foreach ( aav_dt_find_baks( true ) as $b ) {
 		$target = aav_dt_resolve_in_content( $b['rel'] );
 		if ( '' !== $target && is_file( $target ) && @unlink( $target ) ) {
 			$done++;
 		}
 	}
+	delete_transient( 'aav_dt_baks' );
+	aav_dt_log( 'purge_baks', $done . ' fichier(s)' );
 	aav_dt_redirect( 'baks_' . $done, 'files' );
 } );
 
-/* Maintenance : purge des caches (extensions connues + OPcache + transients) */
+/* Maintenance : purge des caches */
 add_action( 'admin_post_aav_dt_purge_cache', function () {
 	aav_dt_guard( 'aav_dt_purge_cache' );
 
 	$done = array();
-
 	if ( function_exists( 'opcache_reset' ) && @opcache_reset() ) {
 		$done[] = 'OPcache';
 	}
 	if ( function_exists( 'wp_cache_flush' ) && wp_cache_flush() ) {
-		$done[] = 'cache objet';
+		$done[] = aav_dt__( 'cache objet', 'object cache' );
 	}
-	// Extensions de cache : chacune expose son propre point d'entree.
 	if ( has_action( 'litespeed_purge_all' ) ) { do_action( 'litespeed_purge_all' ); $done[] = 'LiteSpeed'; }
 	if ( function_exists( 'rocket_clean_domain' ) ) { rocket_clean_domain(); $done[] = 'WP Rocket'; }
 	if ( function_exists( 'w3tc_flush_all' ) ) { w3tc_flush_all(); $done[] = 'W3 Total Cache'; }
@@ -560,15 +726,17 @@ add_action( 'admin_post_aav_dt_purge_cache', function () {
 	if ( class_exists( 'SiteGround_Optimizer\Supercacher\Supercacher' ) ) { do_action( 'siteground_optimizer_flush_cache' ); $done[] = 'SiteGround'; }
 
 	delete_transient( 'aav_dt_gh_release' );
-	$done[] = 'cache des mises a jour';
+	delete_transient( 'aav_dt_baks' );
+	$done[] = aav_dt__( 'cache des mises à jour', 'update cache' );
 
 	set_transient( 'aav_dt_purge_report', $done, 60 );
+	aav_dt_log( 'purge_cache', implode( ', ', $done ) );
 	aav_dt_redirect( 'cache_ok', 'tools' );
 } );
 
-/* Maintenance : forcer la verification des mises a jour */
+/* Maintenance : vérifier les mises à jour */
 add_action( 'admin_post_aav_dt_check_update', function () {
-	aav_dt_guard( 'aav_dt_check_update' );
+	aav_dt_guard( 'aav_dt_check_update', false );
 	delete_transient( 'aav_dt_gh_release' );
 	delete_site_transient( 'update_plugins' );
 	wp_update_plugins();
@@ -605,6 +773,7 @@ add_action( 'admin_post_aav_dt_normalize_mode', function () {
 			$changed++;
 		}
 	}
+	aav_dt_log( 'normalize_blocks', $changed . ' page(s)' );
 	aav_dt_redirect( 'norm_' . $changed, 'tools' );
 } );
 
@@ -614,29 +783,39 @@ add_action( 'admin_post_aav_dt_normalize_mode', function () {
 
 function aav_dt_notice_for( $status ) {
 	$map = array(
-		'nozip'         => array( 'error',   "L'extension PHP ZipArchive n'est pas disponible sur ce serveur." ),
-		'zip_err'       => array( 'error',   "Impossible de creer l'archive." ),
-		'plg_notfound'  => array( 'error',   'Extension inconnue.' ),
-		'ini_ok'        => array( 'success', 'Limites PHP enregistrees. Compte quelques minutes pour la prise en compte.' ),
-		'ini_err'       => array( 'error',   "Echec d'ecriture du fichier de limites (droits en ecriture ?)." ),
-		'ini_empty'     => array( 'error',   'Aucune valeur valide fournie.' ),
-		'mu_ok'         => array( 'success', 'Mu-plugin installe. Une copie de la version precedente a ete placee dans wp-content/.' ),
-		'mu_err'        => array( 'error',   "Echec d'ecriture du mu-plugin (droits en ecriture ?)." ),
-		'mu_invalid'    => array( 'error',   'Le contenu du mu-plugin doit commencer par <?php.' ),
-		'mu_mismatch'   => array( 'error',   'Ecriture incomplete : le contenu relu differe de celui envoye (quota ? securite hebergeur ?).' ),
-		'mu_older'      => array( 'warning', 'Installation annulee : la version envoyee est plus ancienne que celle en place. Coche "forcer" pour retrograder volontairement.' ),
-		'file_ok'       => array( 'success', 'Fichier remplace. Une sauvegarde .bak horodatee a ete creee a cote.' ),
-		'file_err'      => array( 'error',   "Echec d'ecriture du fichier (droits ?). La sauvegarde .bak a ete creee." ),
-		'file_bak_err'  => array( 'error',   'Impossible de creer la sauvegarde .bak : remplacement annule par prudence.' ),
-		'file_badpath'  => array( 'error',   'Chemin invalide (relatif a wp-content, sans "..").' ),
-		'file_notfound' => array( 'error',   "Le fichier cible n'existe pas dans wp-content." ),
-		'file_noupload' => array( 'error',   'Aucun fichier televerse.' ),
-		'del_ok'        => array( 'success', 'Fichier supprime.' ),
-		'del_err'       => array( 'error',   "Suppression impossible : le fichier appartient a un autre utilisateur systeme. Passe par le gestionnaire de fichiers de l'hebergeur." ),
-		'del_badpath'   => array( 'error',   'Chemin invalide (relatif a wp-content, sans "..").' ),
-		'del_notfound'  => array( 'error',   "Le fichier n'existe pas dans wp-content." ),
-		'del_notafile'  => array( 'error',   'La cible est un dossier : seuls les fichiers peuvent etre supprimes ici.' ),
-		'upd_checked'   => array( 'success', 'Verification des mises a jour relancee. Va dans Extensions pour voir le resultat.' ),
+		'nozip'           => array( 'error',   aav_dt__( "L'extension PHP ZipArchive n'est pas disponible sur ce serveur.", 'The PHP ZipArchive extension is not available on this server.' ) ),
+		'zip_err'         => array( 'error',   aav_dt__( "Impossible de créer l'archive.", 'Could not create the archive.' ) ),
+		'plg_notfound'    => array( 'error',   aav_dt__( 'Extension inconnue.', 'Unknown plugin.' ) ),
+		'ini_ok'          => array( 'success', aav_dt__( 'Limites PHP enregistrées. Comptez quelques minutes pour la prise en compte.', 'PHP limits saved. Allow a few minutes for them to take effect.' ) ),
+		'ini_err'         => array( 'error',   aav_dt__( "Échec d'écriture du fichier de limites (droits en écriture ?).", 'Could not write the limits file (write permissions?).' ) ),
+		'ini_empty'       => array( 'error',   aav_dt__( 'Aucune valeur valide fournie.', 'No valid value provided.' ) ),
+		'mu_ok'           => array( 'success', aav_dt__( 'Mu-plugin installé. Une copie de la version précédente a été placée dans aav-backups.', 'Mu-plugin installed. A copy of the previous version was saved to aav-backups.' ) ),
+		'mu_err'          => array( 'error',   aav_dt__( "Échec d'écriture du mu-plugin (droits en écriture ?).", 'Could not write the mu-plugin (write permissions?).' ) ),
+		'mu_invalid'      => array( 'error',   aav_dt__( 'Le contenu du mu-plugin doit commencer par <?php.', 'Mu-plugin content must start with <?php.' ) ),
+		'mu_mismatch'     => array( 'error',   aav_dt__( 'Écriture incomplète : le contenu relu diffère de celui envoyé (quota ? sécurité de l\'hébergeur ?).', 'Incomplete write: the content read back differs from what was sent (quota? host security?).' ) ),
+		'mu_older'        => array( 'warning', aav_dt__( 'Installation annulée : la version envoyée est plus ancienne que celle en place. Cochez « forcer » pour rétrograder volontairement.', 'Install cancelled: the submitted version is older than the one in place. Tick "force" to downgrade on purpose.' ) ),
+		'mu_del_ok'       => array( 'success', aav_dt__( 'Mu-plugin supprimé. Une copie a été conservée dans aav-backups : vous pouvez le restaurer ci-dessous.', 'Mu-plugin deleted. A copy was kept in aav-backups: you can restore it below.' ) ),
+		'mu_del_err'      => array( 'error',   aav_dt__( 'Suppression impossible (droits du fichier).', 'Could not delete the file (permissions).' ) ),
+		'mu_del_bad'      => array( 'error',   aav_dt__( 'Nom de fichier invalide.', 'Invalid file name.' ) ),
+		'mu_del_notfound' => array( 'error',   aav_dt__( 'Ce mu-plugin n\'existe pas.', 'This mu-plugin does not exist.' ) ),
+		'mu_del_bakerr'   => array( 'error',   aav_dt__( 'Impossible de créer la copie de sécurité : suppression annulée.', 'Could not create the safety copy: deletion cancelled.' ) ),
+		'mu_res_ok'       => array( 'success', aav_dt__( 'Mu-plugin restauré.', 'Mu-plugin restored.' ) ),
+		'mu_res_err'      => array( 'error',   aav_dt__( 'Restauration impossible.', 'Restore failed.' ) ),
+		'mu_res_bad'      => array( 'error',   aav_dt__( "Nom d'origine introuvable dans le nom de la sauvegarde.", 'Could not determine the original file name from the backup.' ) ),
+		'mu_res_notfound' => array( 'error',   aav_dt__( 'Sauvegarde introuvable.', 'Backup not found.' ) ),
+		'file_ok'         => array( 'success', aav_dt__( 'Fichier remplacé. Une sauvegarde .bak horodatée a été créée à côté.', 'File replaced. A timestamped .bak backup was created next to it.' ) ),
+		'file_err'        => array( 'error',   aav_dt__( "Échec d'écriture du fichier (droits ?). La sauvegarde .bak a été créée.", 'Could not write the file (permissions?). The .bak backup was created.' ) ),
+		'file_bak_err'    => array( 'error',   aav_dt__( 'Impossible de créer la sauvegarde .bak : remplacement annulé par prudence.', 'Could not create the .bak backup: replacement cancelled as a precaution.' ) ),
+		'file_badpath'    => array( 'error',   aav_dt__( 'Chemin invalide (relatif à wp-content, sans « .. »).', 'Invalid path (relative to wp-content, no "..").' ) ),
+		'file_notfound'   => array( 'error',   aav_dt__( "Le fichier cible n'existe pas dans wp-content.", 'The target file does not exist in wp-content.' ) ),
+		'file_noupload'   => array( 'error',   aav_dt__( 'Aucun fichier téléversé.', 'No file uploaded.' ) ),
+		'file_ext'        => array( 'warning', aav_dt__( "L'extension du fichier envoyé ne correspond pas à celle du fichier cible. Cochez la case pour forcer.", 'The uploaded file extension does not match the target file. Tick the box to force it.' ) ),
+		'del_ok'          => array( 'success', aav_dt__( 'Fichier supprimé.', 'File deleted.' ) ),
+		'del_err'         => array( 'error',   aav_dt__( "Suppression impossible : le fichier appartient à un autre utilisateur système. Passez par le gestionnaire de fichiers de l'hébergeur.", 'Could not delete: the file belongs to another system user. Use your host file manager.' ) ),
+		'del_badpath'     => array( 'error',   aav_dt__( 'Chemin invalide (relatif à wp-content, sans « .. »).', 'Invalid path (relative to wp-content, no "..").' ) ),
+		'del_notfound'    => array( 'error',   aav_dt__( "Le fichier n'existe pas dans wp-content.", 'The file does not exist in wp-content.' ) ),
+		'del_notafile'    => array( 'error',   aav_dt__( 'La cible est un dossier : seuls les fichiers peuvent être supprimés ici.', 'The target is a directory: only files can be deleted here.' ) ),
+		'upd_checked'     => array( 'success', aav_dt__( 'Vérification des mises à jour relancée. Rendez-vous dans Extensions pour voir le résultat.', 'Update check triggered. Go to Plugins to see the result.' ) ),
 	);
 
 	if ( isset( $map[ $status ] ) ) {
@@ -644,23 +823,23 @@ function aav_dt_notice_for( $status ) {
 	}
 	if ( 'cache_ok' === $status ) {
 		$rep = get_transient( 'aav_dt_purge_report' );
-		return array( 'success', 'Caches vides : ' . ( $rep ? implode( ', ', $rep ) : 'aucun cache detecte' ) . '.' );
+		return array( 'success', aav_dt__( 'Caches vidés : ', 'Caches cleared: ' ) . ( $rep ? implode( ', ', $rep ) : aav_dt__( 'aucun cache détecté', 'no cache detected' ) ) . '.' );
 	}
 	if ( 0 === strpos( $status, 'norm_' ) ) {
 		$n = (int) substr( $status, 5 );
 		return array( 'success', $n
-			? sprintf( '%d page(s) normalisee(s) : les blocs AAV s\'ouvriront en mode edition.', $n )
-			: 'Aucune page a modifier : tous les blocs AAV sont deja en mode edition.' );
+			? sprintf( aav_dt__( '%d page(s) normalisée(s) : les blocs AAV s\'ouvriront en mode édition.', '%d page(s) normalised: AAV blocks will open in edit mode.' ), $n )
+			: aav_dt__( 'Aucune page à modifier : tous les blocs AAV sont déjà en mode édition.', 'Nothing to change: all AAV blocks already open in edit mode.' ) );
 	}
 	if ( 0 === strpos( $status, 'baks_' ) ) {
 		$n = (int) substr( $status, 5 );
-		return array( $n ? 'success' : 'warning', sprintf( '%d sauvegarde(s) .bak supprimee(s).', $n ) );
+		return array( $n ? 'success' : 'warning', sprintf( aav_dt__( '%d sauvegarde(s) .bak supprimée(s).', '%d .bak backup(s) deleted.' ), $n ) );
 	}
 	return null;
 }
 
 function aav_dt_card_open( $title, $desc = '' ) {
-	echo '<div class="card" style="max-width:900px;padding:4px 20px 16px;margin:0 0 18px;">';
+	echo '<div class="card" style="max-width:920px;padding:4px 20px 16px;margin:0 0 18px;">';
 	echo '<h2 style="margin-top:14px;">' . esc_html( $title ) . '</h2>';
 	if ( $desc ) {
 		echo '<p class="description" style="margin-bottom:14px;">' . wp_kses_post( $desc ) . '</p>';
@@ -670,13 +849,30 @@ function aav_dt_card_close() {
 	echo '</div>';
 }
 
+/** Sauvegardes du toolkit (mu-plugins remplacés ou supprimés). */
+function aav_dt_list_backups() {
+	$dir = AAV_DT_BACKUP_DIR;
+	if ( ! is_dir( $dir ) ) {
+		return array();
+	}
+	$out = array();
+	foreach ( array_diff( scandir( $dir ), array( '.', '..', 'index.php', '.htaccess' ) ) as $f ) {
+		$p = trailingslashit( $dir ) . $f;
+		if ( is_file( $p ) ) {
+			$out[] = array( 'name' => $f, 'size' => filesize( $p ), 'time' => filemtime( $p ) );
+		}
+	}
+	usort( $out, function ( $a, $b ) { return $b['time'] - $a['time']; } );
+	return $out;
+}
+
 function aav_dt_render_page() {
 	if ( ! current_user_can( AAV_DT_CAP ) ) {
-		wp_die( 'Acces refuse.', '', array( 'response' => 403 ) );
+		wp_die( esc_html( aav_dt__( 'Accès refusé.', 'Access denied.' ) ), '', array( 'response' => 403 ) );
 	}
 
-	$tabs   = aav_dt_tabs();
-	$tab    = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'diag';
+	$tabs = aav_dt_tabs();
+	$tab  = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'diag';
 	if ( ! isset( $tabs[ $tab ] ) ) {
 		$tab = 'diag';
 	}
@@ -684,6 +880,7 @@ function aav_dt_render_page() {
 	$notice = $status ? aav_dt_notice_for( $status ) : null;
 	$action = esc_url( admin_url( 'admin-post.php' ) );
 	$baks   = aav_dt_find_baks();
+	$locked = aav_dt_locked();
 	?>
 	<div class="wrap">
 		<h1 style="display:flex;align-items:baseline;gap:10px;">
@@ -695,10 +892,23 @@ function aav_dt_render_page() {
 			<div class="notice notice-<?php echo esc_attr( $notice[0] ); ?> is-dismissible"><p><?php echo esc_html( $notice[1] ); ?></p></div>
 		<?php endif; ?>
 
+		<?php if ( $locked ) : ?>
+			<div class="notice notice-info">
+				<p><strong><?php aav_dt_e( 'Mode lecture seule.', 'Read-only mode.' ); ?></strong>
+				<?php aav_dt_e(
+					'La constante AAV_DT_LOCK est définie dans wp-config.php : les opérations d\'écriture sont désactivées.',
+					'The AAV_DT_LOCK constant is set in wp-config.php: write operations are disabled.'
+				); ?></p>
+			</div>
+		<?php endif; ?>
+
 		<?php if ( $baks && 'files' !== $tab ) : ?>
 			<div class="notice notice-warning">
-				<p><?php printf( '%d sauvegarde(s) .bak trainent dans wp-content : elles bloquent les mises a jour d\'extensions.', count( $baks ) ); ?>
-					<a href="<?php echo esc_url( aav_dt_url( 'files' ) ); ?>">Voir l'onglet Fichiers</a></p>
+				<p><?php printf(
+					esc_html( aav_dt__( '%d sauvegarde(s) .bak traînent dans wp-content : elles bloquent les mises à jour d\'extensions.', '%d .bak backup(s) left in wp-content: they block plugin updates.' ) ),
+					count( $baks )
+				); ?>
+				<a href="<?php echo esc_url( aav_dt_url( 'files' ) ); ?>"><?php aav_dt_e( 'Voir l\'onglet Fichiers', 'Go to the Files tab' ); ?></a></p>
 			</div>
 		<?php endif; ?>
 
@@ -710,63 +920,101 @@ function aav_dt_render_page() {
 		</h2>
 
 		<?php
-		/* ---------------------------------------------------------- DIAGNOSTIC */
-		if ( 'diag' === $tab ) :
-			aav_dt_card_open( 'Etat du site', "Photographie de l'environnement. Utile avant d'intervenir, et a copier-coller dans un ticket de support." );
+		/* ------------------------------------------------------- DIAGNOSTIC */
+		if ( 'diag' === $tab ) {
+			aav_dt_card_open(
+				aav_dt__( 'État du site', 'Site status' ),
+				aav_dt__( "Photographie de l'environnement. Utile avant d'intervenir, et à copier-coller dans un ticket de support.", 'A snapshot of the environment. Useful before making changes, and to paste into a support ticket.' )
+			);
+			$diag = aav_dt_diagnostics();
 			echo '<table class="widefat striped"><tbody>';
-			foreach ( aav_dt_diagnostics() as $k => $v ) {
-				$flag = ( 'WP_DEBUG' === $k && 'ACTIF' === $v ) ? ' style="color:#b26b00;font-weight:600"' : '';
-				printf( '<tr><td style="width:220px;"><strong>%s</strong></td><td%s>%s</td></tr>', esc_html( $k ), $flag, esc_html( $v ) );
+			foreach ( $diag as $k => $v ) {
+				$flag = ( in_array( $v, array( 'ACTIF', 'ENABLED' ), true ) ) ? ' style="color:#b26b00;font-weight:600"' : '';
+				printf( '<tr><td style="width:240px;"><strong>%s</strong></td><td%s>%s</td></tr>', esc_html( $k ), $flag, esc_html( $v ) );
 			}
 			echo '</tbody></table>';
 			$txt = '';
-			foreach ( aav_dt_diagnostics() as $k => $v ) {
+			foreach ( $diag as $k => $v ) {
 				$txt .= $k . ' : ' . $v . "\n";
 			}
-			echo '<p style="margin-top:14px;"><label for="aav_diag_txt"><strong>Version texte</strong></label></p>';
-			echo '<textarea id="aav_diag_txt" rows="6" class="large-text code" readonly onclick="this.select()">' . esc_textarea( $txt ) . '</textarea>';
+			echo '<p style="margin-top:14px;"><strong>' . esc_html( aav_dt__( 'Version texte', 'Plain text' ) ) . '</strong></p>';
+			echo '<textarea rows="6" class="large-text code" readonly onclick="this.select()">' . esc_textarea( $txt ) . '</textarea>';
 			aav_dt_card_close();
 
-		/* -------------------------------------------------------------- EXPORT */
-		elseif ( 'export' === $tab ) :
+			$log = get_option( 'aav_dt_log', array() );
+			if ( is_array( $log ) && $log ) {
+				aav_dt_card_open(
+					aav_dt__( 'Journal des opérations', 'Operations log' ),
+					aav_dt__( 'Les 30 dernières opérations sensibles réalisées avec cet outil.', 'The last 30 sensitive operations performed with this tool.' )
+				);
+				echo '<table class="widefat striped"><thead><tr>'
+					. '<th>' . esc_html( aav_dt__( 'Date (UTC)', 'Date (UTC)' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Utilisateur', 'User' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Opération', 'Operation' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Détail', 'Detail' ) ) . '</th></tr></thead><tbody>';
+				foreach ( $log as $l ) {
+					printf(
+						'<tr><td>%s</td><td>%s</td><td><code>%s</code></td><td>%s</td></tr>',
+						esc_html( gmdate( 'Y-m-d H:i', (int) $l['time'] ) ),
+						esc_html( $l['user'] ),
+						esc_html( $l['what'] ),
+						esc_html( $l['detail'] )
+					);
+				}
+				echo '</tbody></table>';
+				aav_dt_card_close();
+			}
+
+		/* ----------------------------------------------------------- EXPORT */
+		} elseif ( 'export' === $tab ) {
 			if ( ! function_exists( 'get_plugins' ) ) {
 				require_once ABSPATH . 'wp-admin/includes/plugin.php';
 			}
 			$plugins = get_plugins();
 			$actives = (array) get_option( 'active_plugins', array() );
 
-			aav_dt_card_open( 'Exporter le theme', 'Zip complet du theme actif, sans <code>node_modules</code> ni <code>.git</code>.' );
+			aav_dt_card_open(
+				aav_dt__( 'Exporter le thème', 'Export the theme' ),
+				aav_dt__( 'Zip complet du thème actif, sans <code>node_modules</code> ni <code>.git</code>.', 'Full zip of the active theme, without <code>node_modules</code> or <code>.git</code>.' )
+			);
 			?>
 			<form method="post" action="<?php echo $action; ?>">
 				<?php wp_nonce_field( 'aav_dt_download_theme' ); ?>
 				<input type="hidden" name="action" value="aav_dt_download_theme">
-				<?php submit_button( 'Telecharger ' . basename( get_template_directory() ) . ' (.zip)', 'primary', 'submit', false ); ?>
+				<?php submit_button( aav_dt__( 'Télécharger ', 'Download ' ) . basename( get_template_directory() ) . ' (.zip)', 'primary', 'submit', false ); ?>
 			</form>
 			<?php
 			aav_dt_card_close();
 
-			aav_dt_card_open( 'Exporter une extension', 'Pour archiver l\'etat reel du site ou alimenter un depot Git.' );
+			aav_dt_card_open(
+				aav_dt__( 'Exporter une extension', 'Export a plugin' ),
+				aav_dt__( "Pour archiver l'état réel du site ou alimenter un dépôt Git. Attention : l'archive peut contenir des identifiants présents dans le code.", 'To archive the real state of the site or feed a Git repository. Note: the archive may contain credentials present in the code.' )
+			);
 			?>
 			<form method="post" action="<?php echo $action; ?>">
 				<?php wp_nonce_field( 'aav_dt_download_plugin' ); ?>
 				<input type="hidden" name="action" value="aav_dt_download_plugin">
 				<select name="plugin_file" style="min-width:460px;">
 					<?php foreach ( $plugins as $pfile => $pdata ) :
-						$state = in_array( $pfile, $actives, true ) ? '' : ' (inactive)'; ?>
+						$state = in_array( $pfile, $actives, true ) ? '' : aav_dt__( ' (inactive)', ' (inactive)' ); ?>
 						<option value="<?php echo esc_attr( $pfile ); ?>"><?php echo esc_html( $pdata['Name'] . ' ' . $pdata['Version'] . $state ); ?></option>
 					<?php endforeach; ?>
 				</select>
-				<?php submit_button( 'Telecharger', 'secondary', 'submit', false ); ?>
+				<?php submit_button( aav_dt__( 'Télécharger', 'Download' ), 'secondary', 'submit', false ); ?>
 			</form>
 			<?php
 			aav_dt_card_close();
 
-		/* ------------------------------------------------------------- FICHIERS */
-		elseif ( 'files' === $tab ) :
+		/* ---------------------------------------------------------- FICHIERS */
+		} elseif ( 'files' === $tab ) {
 
 			if ( $baks ) {
-				aav_dt_card_open( 'Sauvegardes .bak detectees', 'Ces fichiers <strong>bloquent les mises a jour d\'extensions</strong> lorsqu\'ils se trouvent dans leur dossier.' );
-				echo '<table class="widefat striped"><thead><tr><th>Fichier</th><th>Taille</th><th>Date</th></tr></thead><tbody>';
+				aav_dt_card_open(
+					aav_dt__( 'Sauvegardes .bak détectées', '.bak backups found' ),
+					aav_dt__( "Ces fichiers <strong>bloquent les mises à jour d'extensions</strong> lorsqu'ils se trouvent dans leur dossier.", 'These files <strong>block plugin updates</strong> when they sit inside a plugin folder.' )
+				);
+				echo '<table class="widefat striped"><thead><tr><th>' . esc_html( aav_dt__( 'Fichier', 'File' ) ) . '</th><th>'
+					. esc_html( aav_dt__( 'Taille', 'Size' ) ) . '</th><th>' . esc_html( aav_dt__( 'Date', 'Date' ) ) . '</th></tr></thead><tbody>';
 				foreach ( $baks as $b ) {
 					printf(
 						'<tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>',
@@ -774,54 +1022,75 @@ function aav_dt_render_page() {
 					);
 				}
 				echo '</tbody></table>';
-				?>
-				<form method="post" action="<?php echo $action; ?>" style="margin-top:12px;"
-				      onsubmit="return confirm('Supprimer les <?php echo count( $baks ); ?> sauvegardes .bak ?');">
-					<?php wp_nonce_field( 'aav_dt_purge_baks' ); ?>
-					<input type="hidden" name="action" value="aav_dt_purge_baks">
-					<?php submit_button( 'Tout supprimer', 'delete', 'submit', false ); ?>
-				</form>
-				<?php
+				if ( ! $locked ) : ?>
+					<form method="post" action="<?php echo $action; ?>" style="margin-top:12px;"
+					      onsubmit="return confirm('<?php echo esc_js( aav_dt__( 'Supprimer toutes les sauvegardes .bak ?', 'Delete all .bak backups?' ) ); ?>');">
+						<?php wp_nonce_field( 'aav_dt_purge_baks' ); ?>
+						<input type="hidden" name="action" value="aav_dt_purge_baks">
+						<?php submit_button( aav_dt__( 'Tout supprimer', 'Delete all' ), 'delete', 'submit', false ); ?>
+					</form>
+				<?php endif;
 				aav_dt_card_close();
 			}
 
-			aav_dt_card_open( 'Remplacer un fichier', 'Chemin relatif a <code>wp-content</code>, par exemple <code>themes/aav/assets/app.min.js</code>. Une sauvegarde <code>.bak</code> horodatee est creee avant remplacement.' );
-			?>
-			<form method="post" action="<?php echo $action; ?>" enctype="multipart/form-data">
-				<?php wp_nonce_field( 'aav_dt_replace_file' ); ?>
-				<input type="hidden" name="action" value="aav_dt_replace_file">
-				<p><input name="target_path" type="text" class="large-text" placeholder="plugins/aav-landing-blocks/aav-landing-blocks.php" required></p>
-				<p><input name="replacement" type="file" required></p>
-				<?php submit_button( 'Remplacer', 'primary', 'submit', false ); ?>
-			</form>
-			<?php
+			aav_dt_card_open(
+				aav_dt__( 'Remplacer un fichier', 'Replace a file' ),
+				aav_dt__( 'Chemin relatif à <code>wp-content</code>, par exemple <code>themes/aav/assets/app.min.js</code>. Une sauvegarde <code>.bak</code> horodatée est créée avant remplacement.', 'Path relative to <code>wp-content</code>, e.g. <code>themes/aav/assets/app.min.js</code>. A timestamped <code>.bak</code> backup is created before replacing.' )
+			);
+			if ( $locked ) {
+				echo '<p><em>' . esc_html( aav_dt__( 'Désactivé en mode lecture seule.', 'Disabled in read-only mode.' ) ) . '</em></p>';
+			} else { ?>
+				<form method="post" action="<?php echo $action; ?>" enctype="multipart/form-data">
+					<?php wp_nonce_field( 'aav_dt_replace_file' ); ?>
+					<input type="hidden" name="action" value="aav_dt_replace_file">
+					<p><input name="target_path" type="text" class="large-text" placeholder="plugins/aav-landing-blocks/aav-landing-blocks.php" required></p>
+					<p><input name="replacement" type="file" required></p>
+					<p><label><input type="checkbox" name="ext_force" value="1"> <?php aav_dt_e( 'Autoriser une extension de fichier différente de la cible', 'Allow a file extension different from the target' ); ?></label></p>
+					<?php submit_button( aav_dt__( 'Remplacer', 'Replace' ), 'primary', 'submit', false ); ?>
+				</form>
+			<?php }
 			aav_dt_card_close();
 
-			aav_dt_card_open( 'Supprimer un fichier', 'Fichiers uniquement, jamais de dossiers. Residus de migration, sauvegardes, fichiers obsoletes.' );
-			?>
-			<form method="post" action="<?php echo $action; ?>" onsubmit="return confirm('Supprimer definitivement ce fichier ?');">
-				<?php wp_nonce_field( 'aav_dt_delete_file' ); ?>
-				<input type="hidden" name="action" value="aav_dt_delete_file">
-				<p><input name="delete_path" type="text" class="large-text" placeholder="plugins/mon-extension/fichier.php.bak-20260902-120703" required></p>
-				<?php submit_button( 'Supprimer', 'delete', 'submit', false ); ?>
-			</form>
-			<?php
+			aav_dt_card_open(
+				aav_dt__( 'Supprimer un fichier', 'Delete a file' ),
+				aav_dt__( 'Fichiers uniquement, jamais de dossiers. Résidus de migration, sauvegardes, fichiers obsolètes.', 'Files only, never directories. Migration leftovers, backups, obsolete files.' )
+			);
+			if ( $locked ) {
+				echo '<p><em>' . esc_html( aav_dt__( 'Désactivé en mode lecture seule.', 'Disabled in read-only mode.' ) ) . '</em></p>';
+			} else { ?>
+				<form method="post" action="<?php echo $action; ?>" onsubmit="return confirm('<?php echo esc_js( aav_dt__( 'Supprimer définitivement ce fichier ?', 'Permanently delete this file?' ) ); ?>');">
+					<?php wp_nonce_field( 'aav_dt_delete_file' ); ?>
+					<input type="hidden" name="action" value="aav_dt_delete_file">
+					<p><input name="delete_path" type="text" class="large-text" placeholder="plugins/mon-extension/fichier.php.bak-20260902-120703" required></p>
+					<?php submit_button( aav_dt__( 'Supprimer', 'Delete' ), 'delete', 'submit', false ); ?>
+				</form>
+			<?php }
 			aav_dt_card_close();
 
-		/* ------------------------------------------------------------ MU-PLUGINS */
-		elseif ( 'mu' === $tab ) :
-			$mu_dir   = defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR . '/mu-plugins';
+		/* -------------------------------------------------------- MU-PLUGINS */
+		} elseif ( 'mu' === $tab ) {
+			$mu_dir   = aav_dt_mu_dir();
 			$writable = is_dir( $mu_dir ) ? is_writable( $mu_dir ) : is_writable( dirname( $mu_dir ) );
 			$existing = is_dir( $mu_dir ) ? array_values( array_diff( scandir( $mu_dir ), array( '.', '..' ) ) ) : array();
 
-			aav_dt_card_open( 'Mu-plugins installes', 'Les mu-plugins sont actives automatiquement et n\'apparaissent pas dans la liste des extensions.' );
+			aav_dt_card_open(
+				aav_dt__( 'Mu-plugins installés', 'Installed mu-plugins' ),
+				aav_dt__( "Les mu-plugins sont activés automatiquement et n'apparaissent pas dans la liste des extensions.", 'Mu-plugins are always active and do not appear in the plugins list.' )
+			);
 			printf(
-				'<p><code>%s</code> : %s en ecriture</p>',
+				'<p><code>%s</code> : %s</p>',
 				esc_html( $mu_dir ),
-				$writable ? '<strong style="color:#00a32a">accessible</strong>' : '<strong style="color:#d63638">NON accessible</strong>'
+				$writable
+					? '<strong style="color:#00a32a">' . esc_html( aav_dt__( 'accessible en écriture', 'writable' ) ) . '</strong>'
+					: '<strong style="color:#d63638">' . esc_html( aav_dt__( 'NON accessible en écriture', 'NOT writable' ) ) . '</strong>'
 			);
 			if ( $existing ) {
-				echo '<table class="widefat striped"><thead><tr><th>Fichier</th><th>Version sur le disque</th><th>Modifie le (UTC)</th><th>Empreinte</th></tr></thead><tbody>';
+				echo '<table class="widefat striped"><thead><tr>'
+					. '<th>' . esc_html( aav_dt__( 'Fichier', 'File' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Version sur le disque', 'Version on disk' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Modifié le (UTC)', 'Modified (UTC)' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Empreinte', 'Checksum' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Action', 'Action' ) ) . '</th></tr></thead><tbody>';
 				foreach ( $existing as $f ) {
 					$p = trailingslashit( $mu_dir ) . $f;
 					if ( ! is_file( $p ) ) {
@@ -829,128 +1098,204 @@ function aav_dt_render_page() {
 					}
 					$head = (string) @file_get_contents( $p, false, null, 0, 2048 );
 					$ver  = preg_match( '/^\s*\*\s*Version:\s*(.+)$/mi', $head, $m ) ? trim( $m[1] ) : 'n/a';
-					printf(
-						'<tr><td><code>%s</code></td><td><strong>%s</strong></td><td>%s</td><td><code>%s</code></td></tr>',
-						esc_html( $f ), esc_html( $ver ),
-						esc_html( gmdate( 'Y-m-d H:i:s', (int) @filemtime( $p ) ) ),
-						esc_html( substr( md5( (string) @file_get_contents( $p ) ), 0, 8 ) )
-					);
+					echo '<tr><td><code>' . esc_html( $f ) . '</code></td>';
+					echo '<td><strong>' . esc_html( $ver ) . '</strong></td>';
+					echo '<td>' . esc_html( gmdate( 'Y-m-d H:i:s', (int) @filemtime( $p ) ) ) . '</td>';
+					echo '<td><code>' . esc_html( substr( md5( (string) @file_get_contents( $p ) ), 0, 8 ) ) . '</code></td>';
+					echo '<td>';
+					if ( ! $locked && preg_match( '/\.php$/i', $f ) ) {
+						?>
+						<form method="post" action="<?php echo $action; ?>" style="margin:0;"
+						      onsubmit="return confirm('<?php echo esc_js( aav_dt__( 'Supprimer ce mu-plugin ? Une copie sera conservée dans aav-backups.', 'Delete this mu-plugin? A copy will be kept in aav-backups.' ) ); ?>');">
+							<?php wp_nonce_field( 'aav_dt_delete_mu' ); ?>
+							<input type="hidden" name="action" value="aav_dt_delete_mu">
+							<input type="hidden" name="mu_file" value="<?php echo esc_attr( $f ); ?>">
+							<button type="submit" class="button button-link-delete"><?php aav_dt_e( 'Supprimer', 'Delete' ); ?></button>
+						</form>
+						<?php
+					} else {
+						echo '&mdash;';
+					}
+					echo '</td></tr>';
 				}
 				echo '</tbody></table>';
 			} else {
-				echo '<p><em>Aucun mu-plugin installe.</em></p>';
+				echo '<p><em>' . esc_html( aav_dt__( 'Aucun mu-plugin installé.', 'No mu-plugin installed.' ) ) . '</em></p>';
 			}
 			aav_dt_card_close();
 
-			aav_dt_card_open( 'Installer ou mettre a jour', 'Le champ est pre-rempli avec la derniere version connue du correctif de navigation (v1.4). Une installation d\'une version <strong>anterieure</strong> a celle du disque est refusee, sauf si tu coches la case de forcage.' );
-			?>
-			<form method="post" action="<?php echo $action; ?>">
-				<?php wp_nonce_field( 'aav_dt_install_mu' ); ?>
-				<input type="hidden" name="action" value="aav_dt_install_mu">
-				<p>
-					<label for="mu_filename"><strong>Nom du fichier</strong></label><br>
-					<input name="mu_filename" id="mu_filename" type="text" class="regular-text" value="aav-scroll-refresh.php">
-				</p>
-				<p>
-					<label for="mu_content"><strong>Contenu</strong></label><br>
-					<textarea name="mu_content" id="mu_content" rows="16" class="large-text code" spellcheck="false"><?php echo esc_textarea( aav_dt_default_mu() ); ?></textarea>
-				</p>
-				<p><label><input type="checkbox" name="mu_force" value="1"> Forcer meme si la version envoyee est plus ancienne</label></p>
-				<?php submit_button( 'Installer le mu-plugin', 'primary', 'submit', false ); ?>
-			</form>
-			<?php
+			$backups = aav_dt_list_backups();
+			if ( $backups ) {
+				aav_dt_card_open(
+					aav_dt__( 'Sauvegardes de mu-plugins', 'Mu-plugin backups' ),
+					aav_dt__( 'Copies conservées avant chaque remplacement ou suppression, dans <code>wp-content/aav-backups</code>.', 'Copies kept before every replacement or deletion, in <code>wp-content/aav-backups</code>.' )
+				);
+				echo '<table class="widefat striped"><thead><tr>'
+					. '<th>' . esc_html( aav_dt__( 'Sauvegarde', 'Backup' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Taille', 'Size' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Date (UTC)', 'Date (UTC)' ) ) . '</th>'
+					. '<th>' . esc_html( aav_dt__( 'Action', 'Action' ) ) . '</th></tr></thead><tbody>';
+				foreach ( $backups as $b ) {
+					echo '<tr><td><code>' . esc_html( $b['name'] ) . '</code></td>';
+					echo '<td>' . esc_html( size_format( $b['size'] ) ) . '</td>';
+					echo '<td>' . esc_html( gmdate( 'Y-m-d H:i', $b['time'] ) ) . '</td>';
+					echo '<td>';
+					if ( ! $locked ) {
+						?>
+						<form method="post" action="<?php echo $action; ?>" style="margin:0;"
+						      onsubmit="return confirm('<?php echo esc_js( aav_dt__( 'Restaurer cette sauvegarde dans mu-plugins ?', 'Restore this backup into mu-plugins?' ) ); ?>');">
+							<?php wp_nonce_field( 'aav_dt_restore_mu' ); ?>
+							<input type="hidden" name="action" value="aav_dt_restore_mu">
+							<input type="hidden" name="backup_file" value="<?php echo esc_attr( $b['name'] ); ?>">
+							<button type="submit" class="button"><?php aav_dt_e( 'Restaurer', 'Restore' ); ?></button>
+						</form>
+						<?php
+					} else {
+						echo '&mdash;';
+					}
+					echo '</td></tr>';
+				}
+				echo '</tbody></table>';
+				aav_dt_card_close();
+			}
+
+			aav_dt_card_open(
+				aav_dt__( 'Installer ou mettre à jour', 'Install or update' ),
+				aav_dt__( "Le champ est pré-rempli avec la dernière version connue du correctif de navigation (v1.4). Installer une version <strong>antérieure</strong> à celle du disque est refusé, sauf si vous cochez la case de forçage.", 'The field is pre-filled with the latest known version of the navigation fix (v1.4). Installing a version <strong>older</strong> than the one on disk is refused unless you tick the force box.' )
+			);
+			if ( $locked ) {
+				echo '<p><em>' . esc_html( aav_dt__( 'Désactivé en mode lecture seule.', 'Disabled in read-only mode.' ) ) . '</em></p>';
+			} else { ?>
+				<form method="post" action="<?php echo $action; ?>">
+					<?php wp_nonce_field( 'aav_dt_install_mu' ); ?>
+					<input type="hidden" name="action" value="aav_dt_install_mu">
+					<p>
+						<label for="mu_filename"><strong><?php aav_dt_e( 'Nom du fichier', 'File name' ); ?></strong></label><br>
+						<input name="mu_filename" id="mu_filename" type="text" class="regular-text" value="aav-scroll-refresh.php">
+					</p>
+					<p>
+						<label for="mu_content"><strong><?php aav_dt_e( 'Contenu', 'Content' ); ?></strong></label><br>
+						<textarea name="mu_content" id="mu_content" rows="16" class="large-text code" spellcheck="false"><?php echo esc_textarea( aav_dt_default_mu() ); ?></textarea>
+					</p>
+					<p><label><input type="checkbox" name="mu_force" value="1"> <?php aav_dt_e( 'Forcer même si la version envoyée est plus ancienne', 'Force even if the submitted version is older' ); ?></label></p>
+					<?php submit_button( aav_dt__( 'Installer le mu-plugin', 'Install mu-plugin' ), 'primary', 'submit', false ); ?>
+				</form>
+			<?php }
 			aav_dt_card_close();
 
-		/* ----------------------------------------------------------- LIMITES PHP */
-		elseif ( 'php' === $tab ) :
+		/* -------------------------------------------------------- LIMITES PHP */
+		} elseif ( 'php' === $tab ) {
 			$sapi     = php_sapi_name();
 			$ini_keys = array(
-				'upload_max_filesize' => "Taille max d'un fichier uploade",
-				'post_max_size'       => "Taille max d'une requete POST",
-				'memory_limit'        => 'Limite memoire',
-				'max_execution_time'  => "Temps d'execution max (secondes)",
+				'upload_max_filesize' => aav_dt__( "Taille maximale d'un fichier téléversé", 'Maximum upload file size' ),
+				'post_max_size'       => aav_dt__( "Taille maximale d'une requête POST", 'Maximum POST size' ),
+				'memory_limit'        => aav_dt__( 'Limite mémoire', 'Memory limit' ),
+				'max_execution_time'  => aav_dt__( "Temps d'exécution maximum (secondes)", 'Maximum execution time (seconds)' ),
 			);
 			aav_dt_card_open(
-				'Limites PHP',
+				aav_dt__( 'Limites PHP', 'PHP limits' ),
 				sprintf(
-					'SAPI : <code>%s</code> &middot; php.ini charge : <code>%s</code>. php.ini n\'est pas editable depuis PHP : on ecrit un <code>.user.ini</code>%s. Compte quelques minutes pour la prise en compte.',
+					aav_dt__(
+						'SAPI : <code>%1$s</code> &middot; php.ini chargé : <code>%2$s</code>. php.ini n\'est pas modifiable depuis PHP : on écrit un <code>.user.ini</code>%3$s. Comptez quelques minutes pour la prise en compte.',
+						'SAPI: <code>%1$s</code> &middot; loaded php.ini: <code>%2$s</code>. php.ini cannot be edited from PHP, so a <code>.user.ini</code> is written%3$s. Allow a few minutes for it to take effect.'
+					),
 					esc_html( $sapi ),
-					esc_html( php_ini_loaded_file() ?: '(aucun)' ),
-					( false !== stripos( $sapi, 'apache' ) ) ? ' et un bloc <code>.htaccess</code>' : ''
+					esc_html( php_ini_loaded_file() ?: '(n/a)' ),
+					( false !== stripos( $sapi, 'apache' ) ) ? aav_dt__( ' et un bloc <code>.htaccess</code>', ' plus an <code>.htaccess</code> block' ) : ''
 				)
 			);
-			?>
-			<form method="post" action="<?php echo $action; ?>">
-				<?php wp_nonce_field( 'aav_dt_save_ini' ); ?>
-				<input type="hidden" name="action" value="aav_dt_save_ini">
-				<table class="form-table" role="presentation">
-					<?php foreach ( $ini_keys as $key => $label ) : ?>
-						<tr>
-							<th scope="row"><label for="<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></label></th>
-							<td>
-								<input name="<?php echo esc_attr( $key ); ?>" id="<?php echo esc_attr( $key ); ?>" type="text"
-								       class="regular-text" placeholder="<?php echo esc_attr( ini_get( $key ) ); ?>">
-								<p class="description">Actuel : <code><?php echo esc_html( ini_get( $key ) ); ?></code>. Ex : 64M, 128M, 300. Vide = inchange.</p>
-							</td>
-						</tr>
-					<?php endforeach; ?>
-				</table>
-				<?php submit_button( 'Appliquer les limites', 'primary', 'submit', false ); ?>
-			</form>
-			<?php
+			if ( $locked ) {
+				echo '<p><em>' . esc_html( aav_dt__( 'Désactivé en mode lecture seule.', 'Disabled in read-only mode.' ) ) . '</em></p>';
+			} else { ?>
+				<form method="post" action="<?php echo $action; ?>">
+					<?php wp_nonce_field( 'aav_dt_save_ini' ); ?>
+					<input type="hidden" name="action" value="aav_dt_save_ini">
+					<table class="form-table" role="presentation">
+						<?php foreach ( $ini_keys as $key => $label ) : ?>
+							<tr>
+								<th scope="row"><label for="<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></label></th>
+								<td>
+									<input name="<?php echo esc_attr( $key ); ?>" id="<?php echo esc_attr( $key ); ?>" type="text"
+									       class="regular-text" placeholder="<?php echo esc_attr( ini_get( $key ) ); ?>">
+									<p class="description">
+										<?php aav_dt_e( 'Actuel :', 'Current:' ); ?> <code><?php echo esc_html( ini_get( $key ) ); ?></code>.
+										<?php aav_dt_e( 'Ex : 64M, 128M, 300. Vide = inchangé.', 'E.g. 64M, 128M, 300. Empty = unchanged.' ); ?>
+									</p>
+								</td>
+							</tr>
+						<?php endforeach; ?>
+					</table>
+					<?php submit_button( aav_dt__( 'Appliquer les limites', 'Apply limits' ), 'primary', 'submit', false ); ?>
+				</form>
+			<?php }
 			aav_dt_card_close();
 
-		/* ----------------------------------------------------------- MAINTENANCE */
-		elseif ( 'tools' === $tab ) :
+		/* -------------------------------------------------------- MAINTENANCE */
+		} elseif ( 'tools' === $tab ) {
 			$caches = aav_dt_cache_plugins();
 
 			aav_dt_card_open(
-				'Vider les caches',
-				'OPcache, cache objet, extensions de cache detectees et cache des mises a jour. A lancer apres tout remplacement de fichier : '
-				. ( $caches ? 'detecte ici : <strong>' . esc_html( implode( ', ', $caches ) ) . '</strong>.' : 'aucune extension de cache detectee.' )
+				aav_dt__( 'Vider les caches', 'Clear caches' ),
+				aav_dt__( 'OPcache, cache objet, extensions de cache détectées et cache des mises à jour. À lancer après tout remplacement de fichier. ', 'OPcache, object cache, detected caching plugins and the update cache. Run it after every file replacement. ' )
+				. ( $caches
+					? aav_dt__( 'Détecté ici : <strong>', 'Detected here: <strong>' ) . esc_html( implode( ', ', $caches ) ) . '</strong>.'
+					: aav_dt__( 'Aucune extension de cache détectée.', 'No caching plugin detected.' ) )
 			);
-			?>
-			<form method="post" action="<?php echo $action; ?>">
-				<?php wp_nonce_field( 'aav_dt_purge_cache' ); ?>
-				<input type="hidden" name="action" value="aav_dt_purge_cache">
-				<?php submit_button( 'Vider tous les caches', 'primary', 'submit', false ); ?>
-			</form>
-			<?php
+			if ( $locked ) {
+				echo '<p><em>' . esc_html( aav_dt__( 'Désactivé en mode lecture seule.', 'Disabled in read-only mode.' ) ) . '</em></p>';
+			} else { ?>
+				<form method="post" action="<?php echo $action; ?>">
+					<?php wp_nonce_field( 'aav_dt_purge_cache' ); ?>
+					<input type="hidden" name="action" value="aav_dt_purge_cache">
+					<?php submit_button( aav_dt__( 'Vider tous les caches', 'Clear all caches' ), 'primary', 'submit', false ); ?>
+				</form>
+			<?php }
 			aav_dt_card_close();
 
-			aav_dt_card_open( 'Mises a jour des extensions', 'Force WordPress a reinterroger les depots, dont GitHub pour les extensions AAV. Utile juste apres avoir publie une release.' );
+			aav_dt_card_open(
+				aav_dt__( 'Mises à jour des extensions', 'Plugin updates' ),
+				aav_dt__( "Force WordPress à réinterroger les dépôts, dont GitHub pour les extensions AAV. Utile juste après avoir publié une release.", 'Forces WordPress to re-check repositories, including GitHub for the AAV plugins. Useful right after publishing a release.' )
+			);
 			?>
 			<form method="post" action="<?php echo $action; ?>">
 				<?php wp_nonce_field( 'aav_dt_check_update' ); ?>
 				<input type="hidden" name="action" value="aav_dt_check_update">
-				<?php submit_button( 'Verifier les mises a jour maintenant', 'secondary', 'submit', false ); ?>
+				<?php submit_button( aav_dt__( 'Vérifier les mises à jour maintenant', 'Check for updates now' ), 'secondary', 'submit', false ); ?>
 			</form>
 			<?php
 			aav_dt_card_close();
 
-			aav_dt_card_open( 'Blocs AAV : forcer le mode edition', 'Le mode apercu/edition est memorise dans la page a l\'insertion du bloc. <strong>Ferme les editeurs de pages ouverts avant de lancer l\'operation.</strong>' );
-			?>
-			<form method="post" action="<?php echo $action; ?>">
-				<?php wp_nonce_field( 'aav_dt_normalize_mode' ); ?>
-				<input type="hidden" name="action" value="aav_dt_normalize_mode">
-				<?php submit_button( 'Normaliser tous les blocs AAV', 'secondary', 'submit', false ); ?>
-			</form>
-			<?php
+			aav_dt_card_open(
+				aav_dt__( 'Blocs AAV : forcer le mode édition', 'AAV blocks: force edit mode' ),
+				aav_dt__( "Le mode aperçu/édition est mémorisé dans la page à l'insertion du bloc. <strong>Fermez les éditeurs de pages ouverts avant de lancer l'opération.</strong>", 'The preview/edit mode is stored in the page when the block is inserted. <strong>Close any open page editors before running this.</strong>' )
+			);
+			if ( $locked ) {
+				echo '<p><em>' . esc_html( aav_dt__( 'Désactivé en mode lecture seule.', 'Disabled in read-only mode.' ) ) . '</em></p>';
+			} else { ?>
+				<form method="post" action="<?php echo $action; ?>">
+					<?php wp_nonce_field( 'aav_dt_normalize_mode' ); ?>
+					<input type="hidden" name="action" value="aav_dt_normalize_mode">
+					<?php submit_button( aav_dt__( 'Normaliser tous les blocs AAV', 'Normalise all AAV blocks' ), 'secondary', 'submit', false ); ?>
+				</form>
+			<?php }
 			aav_dt_card_close();
 
-		endif;
+		}
 		?>
 
-		<p style="max-width:900px;margin-top:24px;background:#fff3cd;border:1px solid #ffe69c;padding:10px 14px;border-radius:4px;font-size:13px;">
-			<strong>Rappel.</strong> Cet outil depose du code executable et modifie des fichiers.
-			Sur un site en production, retire-le une fois l'intervention terminee.
+		<p style="max-width:920px;margin-top:24px;background:#fff3cd;border:1px solid #ffe69c;padding:10px 14px;border-radius:4px;font-size:13px;">
+			<strong><?php aav_dt_e( 'Rappel.', 'Reminder.' ); ?></strong>
+			<?php aav_dt_e(
+				"Cet outil dépose du code exécutable et modifie des fichiers. Sur un site en production, retirez-le une fois l'intervention terminée, ou définissez AAV_DT_LOCK à true dans wp-config.php pour le passer en lecture seule.",
+				'This tool writes executable code and modifies files. On a live site, remove it once your work is done, or set AAV_DT_LOCK to true in wp-config.php to make it read-only.'
+			); ?>
 		</p>
 	</div>
 	<?php
 }
 
 /* =========================================================================
- *  MISES A JOUR DEPUIS GITHUB (releases, sans extension tierce)
+ *  MISES À JOUR DEPUIS GITHUB
  * ====================================================================== */
 add_filter( 'update_plugins_github.com', function ( $update, $plugin_data, $plugin_file ) {
 	if ( AAV_DT_FILE !== $plugin_file ) {
@@ -972,7 +1317,7 @@ add_filter( 'update_plugins_github.com', function ( $update, $plugin_data, $plug
 			)
 		);
 		if ( is_wp_error( $res ) || 200 !== wp_remote_retrieve_response_code( $res ) ) {
-			set_transient( $cache_key, array(), HOUR_IN_SECONDS );
+			set_transient( $cache_key, array(), 15 * MINUTE_IN_SECONDS );
 			return $update;
 		}
 		$release = json_decode( wp_remote_retrieve_body( $res ), true );
@@ -984,6 +1329,9 @@ add_filter( 'update_plugins_github.com', function ( $update, $plugin_data, $plug
 	}
 
 	$remote = ltrim( $release['tag_name'], 'vV' );
+	if ( ! preg_match( '/^\d+(\.\d+)*$/', $remote ) ) {
+		return $update; // tag non conforme : on ignore
+	}
 	if ( version_compare( $remote, $plugin_data['Version'], '<=' ) ) {
 		return $update;
 	}
@@ -991,8 +1339,10 @@ add_filter( 'update_plugins_github.com', function ( $update, $plugin_data, $plug
 	$package = '';
 	if ( ! empty( $release['assets'] ) && is_array( $release['assets'] ) ) {
 		foreach ( $release['assets'] as $asset ) {
-			if ( ! empty( $asset['browser_download_url'] ) && preg_match( '/\.zip$/i', $asset['browser_download_url'] ) ) {
-				$package = $asset['browser_download_url'];
+			$url = isset( $asset['browser_download_url'] ) ? $asset['browser_download_url'] : '';
+			// L'archive doit venir de github.com et être un zip.
+			if ( $url && preg_match( '#^https://github\.com/#', $url ) && preg_match( '/\.zip$/i', $url ) ) {
+				$package = $url;
 				break;
 			}
 		}
@@ -1014,4 +1364,5 @@ add_filter( 'update_plugins_github.com', function ( $update, $plugin_data, $plug
 
 add_action( 'upgrader_process_complete', function () {
 	delete_transient( 'aav_dt_gh_release' );
+	delete_transient( 'aav_dt_baks' );
 } );
