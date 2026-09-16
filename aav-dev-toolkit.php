@@ -6,8 +6,7 @@
  *              installation d'un mu-plugin en un clic. Reserve aux administrateurs.
  * Version:     1.5.0
  * Author:      Biolay Group
- * GitHub Plugin URI: biolay-group/aav-dev-toolkit
- * Primary Branch:    main
+ * Update URI:  https://github.com/biolay-group/aav-dev-toolkit
  *
  * AVERTISSEMENT SECURITE
  * Cet outil peut exporter le theme, modifier la configuration PHP et deposer
