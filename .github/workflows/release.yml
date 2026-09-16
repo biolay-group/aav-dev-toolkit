@@ -1,0 +1,72 @@
+name: Release
+
+# Declenchement : a chaque push sur main. Le job ne fait quelque chose que
+# si le numero de Version dans l'en-tete du plugin a change.
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:        # permet aussi de relancer a la main
+
+permissions:
+  contents: write           # necessaire pour creer le tag et la release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # historique complet : necessaire pour les notes
+
+      - name: Lire la version dans l'en-tete du plugin
+        id: version
+        run: |
+          SLUG="${GITHUB_REPOSITORY##*/}"
+          FILE="$SLUG.php"
+          if [ ! -f "$FILE" ]; then
+            FILE=$(grep -rl "^ \* Plugin Name:" --include="*.php" . | head -1)
+          fi
+          VERSION=$(grep -m1 -E "^\s*\*\s*Version:" "$FILE" | sed -E 's/.*Version:[[:space:]]*//' | tr -d '[:space:]')
+          echo "slug=$SLUG"       >> "$GITHUB_OUTPUT"
+          echo "file=$FILE"       >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Plugin : $FILE — version $VERSION"
+
+      - name: Verifier si le tag existe deja
+        id: check
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Le tag v${{ steps.version.outputs.version }} existe deja : rien a publier."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verifier la syntaxe PHP
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          for f in $(find . -name "*.php" -not -path "./.git/*"); do
+            php -l "$f" || exit 1
+          done
+
+      - name: Construire le zip
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          SLUG="${{ steps.version.outputs.slug }}"
+          mkdir -p "build/$SLUG"
+          tar -cf - \
+            --exclude=./.git --exclude=./.github --exclude=./build \
+            --exclude=./node_modules --exclude='*.zip' --exclude='.DS_Store' \
+            -C . . | tar -xf - -C "build/$SLUG"
+          cd build && zip -rq "../$SLUG.zip" "$SLUG"
+          cd .. && unzip -l "$SLUG.zip"
+
+      - name: Creer le tag et publier la release
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          generate_release_notes: true     # notes automatiques depuis les commits
+          files: ${{ steps.version.outputs.slug }}.zip
