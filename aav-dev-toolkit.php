@@ -5,7 +5,9 @@
  *              limites PHP (via .user.ini ou .htaccess selon le serveur), et
  *              installation d'un mu-plugin en un clic. Reserve aux administrateurs.
  * Version:     1.5.0
- * Author:      Jean-Baptiste Biolay
+ * Author:      Biolay Group
+ * GitHub Plugin URI: biolay-group/aav-dev-toolkit
+ * Primary Branch:    main
  *
  * AVERTISSEMENT SECURITE
  * Cet outil peut exporter le theme, modifier la configuration PHP et deposer
