@@ -5,7 +5,7 @@
  *              diagnostic, export thème/extensions, limites PHP, mu-plugins,
  *              remplacement et suppression de fichiers, purge des caches,
  *              normalisation des blocs AAV. Réservé aux administrateurs.
- * Version:     1.8.0
+ * Version:     1.9.0
  * Author:      Biolay Group
  * Update URI:  https://github.com/biolay-group/aav-dev-toolkit
  * License:     GPL-2.0-or-later
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'AAV_DT_VERSION', '1.8.0' );
+define( 'AAV_DT_VERSION', '1.9.0' );
 define( 'AAV_DT_CAP', 'manage_options' );
 define( 'AAV_DT_SLUG', 'aav-devtools' );
 define( 'AAV_DT_FILE', plugin_basename( __FILE__ ) );
@@ -725,9 +725,9 @@ add_action( 'admin_post_aav_dt_purge_cache', function () {
 	if ( class_exists( 'Breeze_PurgeCache' ) ) { do_action( 'breeze_clear_all_cache' ); $done[] = 'Breeze'; }
 	if ( class_exists( 'SiteGround_Optimizer\Supercacher\Supercacher' ) ) { do_action( 'siteground_optimizer_flush_cache' ); $done[] = 'SiteGround'; }
 
-	delete_transient( 'aav_dt_gh_release' );
+	aav_dt_purge_update_caches();
 	delete_transient( 'aav_dt_baks' );
-	$done[] = aav_dt__( 'cache des mises à jour', 'update cache' );
+	$done[] = aav_dt__( 'cache des mises à jour (WordPress + GitHub des extensions AAV)', 'update cache (WordPress + AAV plugins GitHub)' );
 
 	set_transient( 'aav_dt_purge_report', $done, 60 );
 	aav_dt_log( 'purge_cache', implode( ', ', $done ) );
@@ -737,8 +737,7 @@ add_action( 'admin_post_aav_dt_purge_cache', function () {
 /* Maintenance : vérifier les mises à jour */
 add_action( 'admin_post_aav_dt_check_update', function () {
 	aav_dt_guard( 'aav_dt_check_update', false );
-	delete_transient( 'aav_dt_gh_release' );
-	delete_site_transient( 'update_plugins' );
+	aav_dt_purge_update_caches();
 	wp_update_plugins();
 	aav_dt_redirect( 'upd_checked', 'tools' );
 } );
@@ -815,7 +814,7 @@ function aav_dt_notice_for( $status ) {
 		'del_badpath'     => array( 'error',   aav_dt__( 'Chemin invalide (relatif à wp-content, sans « .. »).', 'Invalid path (relative to wp-content, no "..").' ) ),
 		'del_notfound'    => array( 'error',   aav_dt__( "Le fichier n'existe pas dans wp-content.", 'The file does not exist in wp-content.' ) ),
 		'del_notafile'    => array( 'error',   aav_dt__( 'La cible est un dossier : seuls les fichiers peuvent être supprimés ici.', 'The target is a directory: only files can be deleted here.' ) ),
-		'upd_checked'     => array( 'success', aav_dt__( 'Vérification des mises à jour relancée. Rendez-vous dans Extensions pour voir le résultat.', 'Update check triggered. Go to Plugins to see the result.' ) ),
+		'upd_checked'     => array( 'success', aav_dt__( 'Caches de mise à jour purgés (WordPress et GitHub des extensions AAV) et vérification relancée. Rendez-vous dans Extensions pour voir le résultat.', 'Update caches purged (WordPress and AAV plugins GitHub) and check triggered. Go to Plugins to see the result.' ) ),
 	);
 
 	if ( isset( $map[ $status ] ) ) {
@@ -1254,7 +1253,7 @@ function aav_dt_render_page() {
 
 			aav_dt_card_open(
 				aav_dt__( 'Mises à jour des extensions', 'Plugin updates' ),
-				aav_dt__( "Force WordPress à réinterroger les dépôts, dont GitHub pour les extensions AAV. Utile juste après avoir publié une release.", 'Forces WordPress to re-check repositories, including GitHub for the AAV plugins. Useful right after publishing a release.' )
+				aav_dt__( "Purge les caches de mise à jour de WordPress et de chaque extension AAV (toolkit, Landing Blocks, Testimonials, Hero Video Fix), puis réinterroge GitHub. À utiliser juste après avoir publié une release.", 'Purges the update caches of WordPress and of every AAV plugin (toolkit, Landing Blocks, Testimonials, Hero Video Fix), then re-checks GitHub. Use it right after publishing a release.' )
 			);
 			?>
 			<form method="post" action="<?php echo $action; ?>">
@@ -1294,6 +1293,18 @@ function aav_dt_render_page() {
 	<?php
 }
 
+/* Caches GitHub des extensions AAV (toolkit, landing blocks, testimonials,
+   hero video fix). Purgés ensemble par « Vérifier les mises à jour » et
+   « Vider tous les caches », pour qu'une release publiée soit vue tout de
+   suite et non après expiration du cache de chaque extension. */
+function aav_dt_gh_transients() {
+	return (array) apply_filters( 'aav_dt_gh_transients', array( 'aav_dt_gh_release', 'aav_lb_gh_release', 'aav_tst_gh_release', 'aav_hv_gh_release' ) );
+}
+function aav_dt_purge_update_caches() {
+	foreach ( aav_dt_gh_transients() as $t ) delete_transient( $t );
+	delete_site_transient( 'update_plugins' );
+}
+
 /* =========================================================================
  *  MISES À JOUR DEPUIS GITHUB
  * ====================================================================== */
@@ -1321,7 +1332,7 @@ add_filter( 'update_plugins_github.com', function ( $update, $plugin_data, $plug
 			return $update;
 		}
 		$release = json_decode( wp_remote_retrieve_body( $res ), true );
-		set_transient( $cache_key, $release, 6 * HOUR_IN_SECONDS );
+		set_transient( $cache_key, $release, HOUR_IN_SECONDS );
 	}
 
 	if ( empty( $release['tag_name'] ) ) {
@@ -1366,3 +1377,9 @@ add_action( 'upgrader_process_complete', function () {
 	delete_transient( 'aav_dt_gh_release' );
 	delete_transient( 'aav_dt_baks' );
 } );
+
+/* Visiter Tableau de bord > Mises à jour ou Extensions réinterroge GitHub
+   (WordPress limite lui-même la fréquence de ces vérifications). */
+foreach ( array( 'load-update-core.php', 'load-plugins.php' ) as $aav_dt_hook ) {
+	add_action( $aav_dt_hook, function () { delete_transient( 'aav_dt_gh_release' ); }, 1 );
+}
